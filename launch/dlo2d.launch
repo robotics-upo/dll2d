@@ -1,0 +1,18 @@
+<!--
+-->
+<launch>
+ 
+  <node name="dlo2d_node" type="dlo2d_node" pkg="dll2d" output="screen" >   
+    <param name="in_scan" value="/scan" />
+    <param name="base_frame_id" value="/base_link" />
+    <param name="odom_frame_id" value="/odom" />
+    <param name="keyframe_dist" value="2.0" /> 
+    <param name="keyframe_rot" value="1.0" />
+    <param name="tdf_grid_size" value="60.0" />
+    <param name="tdf_grid_res" value="0.05" />
+    <param name="solver_max_iter"   value="50"/>
+    <param name="solver_max_threads"   value="1"/>
+    
+  </node>
+
+</launch>	

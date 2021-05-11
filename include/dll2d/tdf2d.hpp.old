@@ -1,0 +1,257 @@
+#ifndef __TDF2D_HPP__
+#define __TDF2D_HPP__
+
+#include <stdlib.h>
+#include <algorithm>  
+#include <bitset>
+#include <vector>
+#include <cstring>
+#include <boost/thread.hpp>
+#include <nav_msgs/OccupancyGrid.h>
+#include <dll2d/point2d.hpp>
+#include <dll2d/bilinearparams.hpp>
+
+#define TDF2D_MAX(a,b) ((a)>(b)?(a):(b)) 
+
+class TDF2D
+{
+private:
+	
+	// 2D grid information
+	BilinearParams *m_gridBilinear;		// Bilinear parameters interpolation
+	uint32_t *m_gridMask;				// Binary mask for Manhatan distance
+	uint8_t *m_gridDist;				// Manhatan distance grid
+	uint64_t m_gridSize; 
+	uint32_t m_gridSizeX, m_gridSizeY;
+
+	// Grid parameters
+	float m_maxX, m_maxY;
+	float m_minX, m_minY;
+	float m_resolution, m_oneDivRes;
+	
+public:
+
+	TDF2D(void) 
+	{
+	 	m_maxX = 50;
+		m_maxY = 50;
+		m_minX = -50;
+		m_minY = -50;
+		m_resolution = 0.05;
+		m_gridDist = NULL;
+		m_gridBilinear = NULL;
+		m_gridMask = NULL;
+	}
+
+	~TDF2D(void)
+	{
+		if(m_gridBilinear != NULL)
+			free(m_gridBilinear);
+		if(m_gridMask != NULL)
+			free(m_gridMask);
+		if(m_gridDist != NULL)
+			free(m_gridDist);
+	}
+
+	void setup(float minX, float maxX, float minY, float maxY, float resolution)
+	{
+		m_maxX = maxX;
+		m_maxY = maxY;
+		m_minX = minX;
+		m_minY = minY;
+		m_resolution = resolution;
+
+		// Free memory if needed
+		if(m_gridBilinear != NULL)
+			free(m_gridBilinear);
+		if(m_gridMask != NULL)
+			free(m_gridMask);
+		if(m_gridDist != NULL)
+			free(m_gridDist);
+		
+		// Memory allocation for the grid
+		m_oneDivRes = 1.0/m_resolution;
+		m_gridSizeX = fabs(m_maxX-m_minX)*m_oneDivRes;
+		m_gridSizeY = fabs(m_maxY-m_minY)*m_oneDivRes;
+		m_gridSize = m_gridSizeX*m_gridSizeY;
+		m_gridBilinear = (BilinearParams *)malloc(m_gridSize*sizeof(BilinearParams));
+		m_gridMask = (uint32_t *)malloc(m_gridSize*sizeof(uint32_t));
+		m_gridDist = (uint8_t *)malloc(m_gridSize*sizeof(uint8_t));
+
+		// Clear buffers
+		clear();
+	}
+
+	void clear(void)
+	{
+		std::memset(m_gridBilinear, 0, m_gridSize*sizeof(BilinearParams));
+		std::memset(m_gridMask, -1, m_gridSize*sizeof(uint32_t));
+		std::memset(m_gridDist, -1, m_gridSize*sizeof(uint8_t));
+	}
+
+	void loadCloud(std::vector<Point2D> &cloud)
+	{
+		// Creates the manhatan distance mask kernel
+		// The point is centered into 3D kernel
+		int k = 0;
+		uint32_t kernel[33*33];
+		for(int y=-16; y<=16; y++)
+			for(int x=-16; x<=16; x++)
+				kernel[k++] = ((uint32_t)0xffffffff) >> TDF2D_MAX(31 - abs(x) - abs(y), 0);
+ 
+		// Applies the pre-computed kernel to all grid cells centered in the cloud points 
+		const float step = 16*m_resolution;
+		for(uint32_t i=0; i<cloud.size(); i++)
+		{
+			if(!isIntoGrid(cloud[i].x-step, cloud[i].y-step) || !isIntoGrid(cloud[i].x+step, cloud[i].y+step))
+				continue;
+
+			int xi, yi, k;
+			uint64_t idx, idy = pointToGrid(cloud[i].x-step, cloud[i].y-step);
+			for(yi=0, k=0; yi<33; yi++, idy+=m_gridSizeX)
+				for(xi=0, idx=idy; xi<33; xi++)
+					m_gridMask[idx++] &= kernel[k++];  
+		}
+
+		// Computes manhatan distance based on the mask value
+		for(uint64_t i=0; i<m_gridSize; i++)
+			m_gridDist[i] = std::bitset<32>(m_gridMask[i]).count();			
+
+		// Computes bilinear interpolation parameters
+		computeBilinearInterpolation();
+	}
+
+	void loadCloud(std::vector<Point2D> &cloud, float tx, float ty, float yaw)
+	{
+		std::vector<Point2D> out;
+
+		float c = cos(yaw);
+		float s = sin(yaw);
+		out.resize(cloud.size());
+		for(uint32_t i=0; i<out.size(); i++)
+		{
+			out[i].x = c*cloud[i].x - s*cloud[i].y + tx;
+			out[i].y = s*cloud[i].x + c*cloud[i].y + ty; 
+		}
+		loadCloud(out);
+	}
+
+	void loadGrid(const nav_msgs::OccupancyGrid &occGrid)
+	{
+		std::vector<Point2D> out;
+
+		// Setup TDF grid parameters
+		setup(occGrid.info.origin.position.x, occGrid.info.origin.position.x + occGrid.info.width*occGrid.info.resolution, 
+		      occGrid.info.origin.position.y, occGrid.info.origin.position.y + occGrid.info.height*occGrid.info.resolution,
+			  occGrid.info.resolution);
+
+		// Compute cloud from grid
+		Point2D p;
+		uint32_t i, j, k;
+		for(i=0, k=0; i < occGrid.info.height; i++)
+			for(j=0; j < occGrid.info.width; j++, k++)
+				if(occGrid.data[k] > 0.5)
+				{
+					p.x = occGrid.info.origin.position.x + 	j*occGrid.info.resolution;
+					p.y = occGrid.info.origin.position.y + 	i*occGrid.info.resolution;
+					out.push_back(p);
+				}
+
+		loadCloud(out);
+	}
+	
+	inline bool isIntoGrid(const float &x, const float &y)
+	{
+		return (x > m_minX && y > m_minY && x < m_maxX && y < m_maxY);
+	}
+
+	inline bool isIntoGrid(const uint64_t &index)
+	{
+		return (index >= 0 && index < m_gridSize);
+	}
+
+	double getDist(double x, double y)
+	{
+		uint8_t r = 255;
+		if(isIntoGrid(x, y))
+			r = m_gridDist[pointToGrid(x, y)];
+		return r;
+	}
+
+	BilinearParams getDistInterpolation(double x, double y)
+	{
+		BilinearParams r;
+		if(isIntoGrid(x, y))
+			r = m_gridBilinear[pointToGrid(x, y)];
+		return r;
+	}
+
+	void buildGridMsg(nav_msgs::OccupancyGrid &gridMsg)
+	{
+		static int seq = 0;
+		
+		// Setup grid msg
+		gridMsg.header.stamp = ros::Time::now();
+		gridMsg.header.seq = seq++;
+		gridMsg.info.map_load_time = ros::Time::now();
+		gridMsg.info.resolution = m_resolution;
+		gridMsg.info.width = m_gridSizeX;
+		gridMsg.info.height = m_gridSizeY;
+		gridMsg.info.origin.position.x = m_minX;
+		gridMsg.info.origin.position.y = m_minY;
+		gridMsg.info.origin.position.z = 0.0;
+		gridMsg.info.origin.orientation.x = 0.0;
+		gridMsg.info.origin.orientation.y = 0.0;
+		gridMsg.info.origin.orientation.z = 0.0;
+		gridMsg.info.origin.orientation.w = 1.0;
+		gridMsg.data.resize(m_gridSize);
+
+		// Copy data into grid msg and scale the probability to [0,100]
+		float maxProb = 100/32;
+		for(int i=0; i<m_gridSize; i++)
+			gridMsg.data[i] = (int8_t)( -(m_gridDist[i]-32.0)*100.0/32.0 );
+	}
+
+protected:
+
+	bool computeBilinearInterpolation(void)
+	{
+		int ix, iy;
+		float x1, y1, x2, y2;
+		float div = 1.0/(m_resolution*m_resolution);
+		uint8_t *p11, *p12, *p21, *p22;
+		BilinearParams *pParams;
+
+		for(iy=0, y1=m_minY, y2=m_minY+m_resolution; iy<m_gridSizeY-1; iy++, y1+=m_resolution, y2+=m_resolution)
+		{
+			p11 = m_gridDist+m_gridSizeY*iy;
+			p12 = p11 + m_gridSizeY;
+			p21 = p11 + 1;
+			p22 = p12 + 1;
+			pParams = m_gridBilinear+m_gridSizeY*iy;
+
+			for(ix=0, x1=m_minX, x2=m_minX+m_resolution; ix<m_gridSizeX-1; ix++, x1+=m_resolution, x2+=m_resolution)
+			{
+				BilinearParams p;
+				float f11 = *(p11++), f12 = *(p12++), f21 = *(p21++), f22 = *(p22++); 
+				
+				p.a0 = (+f11*x2*y2 - f12*x2*y1 - f21*x1*y2 + f22*x1*y1)*div;
+				p.a1 = (-f11*y2    + f12*y1    + f21*y2    - f22*y1   )*div;
+				p.a2 = (-f11*x2    + f12*x2    + f21*x1    - f22*x1   )*div;
+				p.a3 = (+f11       - f12       - f21       + f22      )*div;
+				
+				*(pParams++) = p;
+			}
+		}
+
+		return true;
+	}
+	
+	inline uint64_t pointToGrid(const float &x, const float &y)
+	{
+		return (uint64_t)((x-m_minX)*m_oneDivRes) + (uint64_t)((y-m_minY)*m_oneDivRes)*m_gridSizeX;
+	}	
+};	
+
+
+#endif
