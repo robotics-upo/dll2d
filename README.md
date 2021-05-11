@@ -1,4 +1,4 @@
-# dll2d
+# DLL-2D
 
 ## Summary
 This package presents DLL2D, a direct localization and odometry approach using 2D LIDAR. 
